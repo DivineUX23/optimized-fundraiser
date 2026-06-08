@@ -1,10 +1,10 @@
 use pinocchio::{
     AccountView, ProgramResult, cpi::{Seed, Signer}, error::ProgramError, sysvars::{Sysvar, clock::Clock}
 };
-use pinocchio_pubkey::derive_address;
 
 use crate::{state::{Fundraiser, Contributor}, SECONDS_TO_DAYS};
 
+#[inline(always)]
 pub fn process_refund_instruction(accounts: &mut [AccountView], data: &[u8]) -> ProgramResult {
     let [
         contributor,
@@ -22,34 +22,27 @@ pub fn process_refund_instruction(accounts: &mut [AccountView], data: &[u8]) -> 
     };
 
     {
-        let contributor_ata_state = pinocchio_token::state::Account::from_account_view(contributor_ata)?;
-        if contributor_ata_state.owner() != contributor.address() {
+        let ata_state = unsafe { contributor_ata.borrow_unchecked() };
+
+        let ata_mint = unsafe { &*(ata_state.as_ptr() as *const [u8; 32]) };
+
+        let ata_owner = unsafe { &*(ata_state.as_ptr().add(32) as *const [u8; 32]) };
+
+        if ata_owner != contributor.address().as_array() {
             return Err(ProgramError::IllegalOwner);
         }
-        
-        if contributor_ata_state.mint() != mint_to_raise.address() {
+
+        if ata_mint != mint_to_raise.address().as_array() {
             return Err(ProgramError::InvalidAccountData);
         }
-        
     }
 
-    let bump = data[0];
-    let contributor_bump = data[1];
-
-    let seed = [b"contributor".as_ref(), contributor.address().as_ref(), &[contributor_bump]];
-
-    let contributor_account_pda = derive_address(&seed, None, &crate::ID.to_bytes());
-    //assert_eq!(contributor_account_pda, *contributor_account.address().as_array());
-    if contributor_account_pda != *contributor_account.address().as_array() {
-
-        return Err(ProgramError::InvalidAccountData);
-    }
-
+    let bump = unsafe { *( data.as_ptr() ) };
 
     let fundraiser_data = Fundraiser::from_account_info(fundraiser)?;
 
-    if fundraiser_data.maker() != maker.address() {
-        return Err(ProgramError::InvalidAccountData);
+    if fundraiser_data.maker().as_array() != maker.address().as_array() {
+        return Err(ProgramError::InvalidArgument);
     }
 
     let contributor_data = Contributor::from_account_info(contributor_account)?;
@@ -59,15 +52,13 @@ pub fn process_refund_instruction(accounts: &mut [AccountView], data: &[u8]) -> 
         return Err(ProgramError::InvalidArgument);
     }
 
-    let vault_data = unsafe {vault.borrow_unchecked()};
-    let vault_amount = u64::from_le_bytes(vault_data[64..72].try_into().unwrap());
+    let vault_amount = unsafe {(vault.borrow_unchecked().as_ptr().add(64) as *const u64).read_unaligned()};
 
-    if vault_amount > fundraiser_data.amount_to_raise() {
+    if vault_amount >= fundraiser_data.amount_to_raise() {
         return Err(ProgramError::InvalidArgument);
     }
 
-    let fund_amount = fundraiser_data.current_amount() - contributor_data.amount();
-    fundraiser_data.set_current_amount(fund_amount);
+    fundraiser_data.set_current_amount(fundraiser_data.current_amount() - contributor_data.amount());
 
 
     let bump_bytes = [bump];
@@ -82,12 +73,9 @@ pub fn process_refund_instruction(accounts: &mut [AccountView], data: &[u8]) -> 
     pinocchio_token::instructions::Transfer::new(vault, contributor_ata, fundraiser, contributor_data.amount())
         .invoke_signed(&[signer])?;
 
-    let contributor_account_lamports = contributor_account.lamports();
 
-
-    contributor.set_lamports(contributor.lamports() + contributor_account_lamports);
+    contributor.set_lamports(contributor.lamports() + contributor_account.lamports());
     contributor_account.set_lamports(0);
-
 
     let _ = contributor_account.close();
 

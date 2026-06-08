@@ -1,11 +1,12 @@
 use pinocchio::{
-    AccountView, ProgramResult, cpi::{Seed, Signer}, error::ProgramError, sysvars::{Sysvar, clock::Clock, rent::Rent}
+    AccountView, ProgramResult, cpi::{Seed, Signer}, error::ProgramError, sysvars::{Sysvar, clock::Clock}
 };
-use pinocchio_pubkey::derive_address;
 use pinocchio_system::instructions::CreateAccount;
 
-use crate::{state::{Fundraiser, Contributor}, SECONDS_TO_DAYS, MAX_CONTRIBUTION_PERCENTAGE, PERCENTAGE_SCALER};
+use crate::{constants::{CONTRIBUTOR_RENT_EXEMPT, MAX_CONTRIBUTION_DENOMINATOR, SECONDS_TO_DAYS}, state::{Contributor, Fundraiser}};
 
+
+#[inline(always)]
 pub fn process_contribute_instruction(accounts: &mut [AccountView], data: &[u8]) -> ProgramResult {
     let [
         contributor,
@@ -23,46 +24,39 @@ pub fn process_contribute_instruction(accounts: &mut [AccountView], data: &[u8])
     };
 
     {
-        let contributor_ata_state = pinocchio_token::state::Account::from_account_view(contributor_ata)?;
-        if contributor_ata_state.owner() != contributor.address() {
+        let ata_state = unsafe { contributor_ata.borrow_unchecked() };
+
+        let ata_mint = unsafe { &*(ata_state.as_ptr() as *const [u8; 32]) };
+
+        let ata_owner = unsafe { &*(ata_state.as_ptr().add(32) as *const [u8; 32]) };
+
+
+        if ata_owner != contributor.address().as_array() {
             return Err(ProgramError::IllegalOwner);
         }
-        if contributor_ata_state.mint() != mint_to_raise.address() {
+
+        if ata_mint != mint_to_raise.address().as_array() {
             return Err(ProgramError::InvalidAccountData);
         }
     }
 
 
-    let amount = u64::from_le_bytes(data[0..8].try_into().unwrap());
-    let bump = data[8];
+    let amount = unsafe { ( data.as_ptr() as *const u64 ).read_unaligned() };
 
-    let seed = [b"contributor".as_ref(), contributor.address().as_ref(), &[bump]];
-
-    let contributor_account_pda = derive_address(&seed, None, &crate::ID.to_bytes());
-    assert_eq!(contributor_account_pda, *contributor_account.address().as_array());
+    let bump = unsafe { *( data.as_ptr().add(8) ) };
 
     let fundraiser_data = Fundraiser::from_account_info(fundraiser)?;
-    
-    let mint_data = mint_to_raise.try_borrow()?;
-    if mint_data.len() < 45 {
-        return Err(ProgramError::InvalidAccountData);
-    }
 
-    let decimals = mint_data[44];
+    let max_contribution = fundraiser_data.amount_to_raise() / MAX_CONTRIBUTION_DENOMINATOR;
 
-    if amount <= 1u8.pow(decimals as u32) as u64 {
-        return Err(ProgramError::NotEnoughAccountKeys);
+    if amount == 0 || amount > max_contribution {
+        return Err(ProgramError::InvalidArgument);
     }
-
-    
-    if amount > (fundraiser_data.amount_to_raise() * MAX_CONTRIBUTION_PERCENTAGE) / PERCENTAGE_SCALER {
-        return Err(ProgramError::ArithmeticOverflow);
-    }
-    
 
     let current_time = Clock::get()?.unix_timestamp;
-    if fundraiser_data.duration >= ((current_time - fundraiser_data.time_started())/SECONDS_TO_DAYS) as u8 {
-        return Err(ProgramError::MaxInstructionTraceLengthExceeded);
+    let days = ((current_time - fundraiser_data.time_started())/SECONDS_TO_DAYS) as u8;
+    if fundraiser_data.duration >= days {
+        return Err(ProgramError::InvalidArgument);
     }
 
 
@@ -79,25 +73,29 @@ pub fn process_contribute_instruction(accounts: &mut [AccountView], data: &[u8])
         CreateAccount {
             from: contributor,
             to: contributor_account,
-            lamports: Rent::get()?.try_minimum_balance(Contributor::LEN)?,
+            lamports: CONTRIBUTOR_RENT_EXEMPT,
             space: Contributor::LEN as u64,
             owner: &crate::ID
         }
         .invoke_signed(&[signer])?;
+
+        let contributor_data = Contributor::from_account_info(contributor_account)?;
+
+        contributor_data.set_amount(amount);
+
+    } else {
+
+        let contributor_data = Contributor::from_account_info(contributor_account)?;
+        
+        let fund_amount = contributor_data.amount();
+
+        if fund_amount + amount > max_contribution {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        contributor_data.set_amount(fund_amount + amount);
+
     }
-
-
-    let contributor_data = Contributor::from_account_info(contributor_account)?;
-
-    
-    if (contributor_data.amount() > (fundraiser_data.amount_to_raise() * MAX_CONTRIBUTION_PERCENTAGE) / PERCENTAGE_SCALER)
-        && (contributor_data.amount() + amount > (fundraiser_data.amount_to_raise() * MAX_CONTRIBUTION_PERCENTAGE) / PERCENTAGE_SCALER) {
-        return Err(ProgramError::InvalidArgument);
-    }
-
-
-    let fund_amount = contributor_data.amount();
-    contributor_data.set_amount(fund_amount + amount);
 
     pinocchio_token::instructions::Transfer::new(contributor_ata, vault, contributor, amount)
         .invoke()?;

@@ -10,30 +10,28 @@ mod constants;
 mod test;
 
 use instructions::*;
-use state::*;
 use constants::*;
 
 entrypoint!(process_instruction);
 
 declare_id!("96TFrsG998MvvrfuShRQmSemkzN555pnidGF4gquJsKr");
 
+#[inline(always)]
 pub fn process_instruction(
     program_id: &Address,
     accounts: &mut [AccountView],
     instruction_data: &[u8]
 ) -> ProgramResult {
-    assert_eq!(program_id, &ID);
 
-    let (discriminator, data) = instruction_data
-    .split_first()
-    .ok_or(ProgramError::InvalidAccountData)?;
+    let discriminator = unsafe { *instruction_data.as_ptr() };
+    let data = unsafe { instruction_data.get_unchecked(1..) };
 
-    match FundraiserInstructions::try_from(discriminator)? {
-        FundraiserInstructions::Initialize => instructions::process_initialize_instruction(accounts, data)?,
-        FundraiserInstructions::Contributor => instructions::process_contribute_instruction(accounts, data)?,
-        FundraiserInstructions::Checker => instructions::process_checker_instruction(accounts, data)?,
-        FundraiserInstructions::Refund => instructions::process_refund_instruction(accounts, data)?,
-
+    match discriminator {
+        0 => process_initialize_instruction(accounts, data)?,
+        1 => process_contribute_instruction(accounts, data)?,
+        2 => process_checker_instruction(accounts, data)?,
+        3 => process_refund_instruction(accounts, data)?,
+        _ => Err(ProgramError::InvalidInstructionData)?
     }
 
     Ok(())
